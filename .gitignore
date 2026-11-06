@@ -1,0 +1,7 @@
+/target
+/.env
+/data/
+
+# agent 的工作目录内容（运行产物、验收夹具）不入库
+/workspace/*
+!/workspace/.gitkeep
