@@ -35,7 +35,10 @@ cargo build
 | `AGENT_MAX_STEPS` | `10` | 单个任务的循环上限 |
 | `AGENT_MAX_TOKENS` | `4096` | 单次回复的 token 上限 |
 | `AGENT_WORKSPACE` | `workspace` | 文件工具唯一可访问的目录 |
-| `AGENT_LOG` | 开 | 设为 `0` 关闭步骤日志 |
+| `AGENT_LOG` | 开 | 设为 `0` 关闭终端里的步骤日志 |
+| `AGENT_LOG_FILE` | 开 | 设为 `0` 关闭 JSONL 运行日志文件 |
+| `AGENT_LOG_DIR` | `logs` | 运行日志目录，每次启动一个文件 |
+| `AGENT_LOG_CONTENT_LIMIT` | `4000` | 日志里单个长文本字段最多保留的字符数 |
 
 `LLM_BASE_URL` 需要指向一个**支持 function calling / tool use 的 OpenAI 兼容端点**，
 例如 DashScope（`https://dashscope.aliyuncs.com/compatible-mode/v1`）、DeepSeek、
@@ -71,6 +74,53 @@ src/types.rs   与协议无关的会话消息结构
 | `write_file` | 写 `workspace/` 内的文本文件 | `path`、`content` |
 
 工具失败不会让程序崩溃：错误文本会以 `is_error` 结果回传给模型，由模型自行修正或换方案。
+
+## 运行日志（学习与排障用）
+
+每次启动会写一个 **JSONL** 文件到 `logs/`，一行一个事件，逐行 flush（崩溃或
+Ctrl+C 也不丢已发生的事件）。终端打印的是摘要，日志文件里是完整链路。
+
+```bash
+./scripts/logview.sh            # 最近一次运行的可读执行轨迹
+./scripts/logview.sh --summary  # 事件统计、任务结果、每个请求的 token 用量
+./scripts/logview.sh --step 2   # 只看某一步
+./scripts/logview.sh --task 1   # 只看某个任务（多轮对话里用）
+./scripts/logview.sh --json     # 原始 JSON，自己接 jq
+```
+
+轨迹长这样（`→` 是发出、`←` 是收到，括号里是耗时）：
+
+```text
+╭─ 任务 #1  「查一下香港今天的天气，把结果写到 weather.txt」
+├─ 第 1/10 步
+│   ├→ 请求模型  messages=2  tools=calculator,get_weather,read_file,write_file  3960B
+│   ├← 模型回复  stop=tool_calls  1.2s
+│   │      · get_weather({"city":"香港"})
+│   ├✓ get_weather  2.3s  37 字符
+│   │    「香港：气温 23.7°C（体感 26.5°C），湿度 91%，天气：毛毛雨」
+├─ 第 2/10 步
+│   ├← 模型回复  stop=stop  1.0s
+│   │    文字：「香港今天气温 23.7°C…结果已写入 weather.txt。」
+╰─ ✓ 完成  步数=2  总耗时=3.6s
+```
+
+记录的事件：
+
+| 事件 | 含义 | 关键字段 |
+| --- | --- | --- |
+| `session_start` / `session_end` | 会话起止 | 模型、base_url、最大步数、工作目录 |
+| `task_start` / `task_end` | 一次任务起止 | 任务原文、结果（`answered` / `max_steps` / `interrupted` / `llm_error`）、步数、总耗时 |
+| `step_start` | 进入第 N 步 | 消息历史长度 |
+| `llm_request` | 发给模型的**完整请求体** | messages、tools、系统提示词、字节数 |
+| `llm_turn` | 模型这一步的回复 | 文字、`stop_reason`、工具调用列表、耗时 |
+| `tool_call` / `tool_result` | 工具执行 | 工具名、参数、结果、是否错误、耗时 |
+| `llm_retry` / `llm_http_error` / `llm_error` | 请求失败与重试 | HTTP 状态、是否可重试、错误原文、退避时长 |
+
+每条事件都带 `ts`（毫秒精度）、`seq`（严格递增，还原真实顺序）、`session`、`run`、`step`。
+
+**日志里不含 API Key**（Key 只在 HTTP 头里，从不进入被记录的结构），有单测
+`logger::tests::api_key_never_reaches_the_log` 守着。超长内容按
+`AGENT_LOG_CONTENT_LIMIT` 截断并标注原长度。`logs/` 已在 `.gitignore` 中。
 
 ## 与需求文档的偏差（重要）
 

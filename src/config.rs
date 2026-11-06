@@ -52,6 +52,12 @@ pub struct Config {
     pub system_prompt: String,
     /// 是否打印每一步的日志（`AGENT_LOG=0` 关闭）。
     pub log_enabled: bool,
+    /// 运行日志（JSONL）的输出目录（`AGENT_LOG_DIR`，默认 `logs`）。
+    pub log_dir: PathBuf,
+    /// 是否写运行日志文件（`AGENT_LOG_FILE=0` 关闭）。
+    pub log_file_enabled: bool,
+    /// 运行日志里单个长文本字段最多保留的字符数（`AGENT_LOG_CONTENT_LIMIT`）。
+    pub log_content_limit: usize,
 }
 
 impl Config {
@@ -100,6 +106,25 @@ impl Config {
             })
             .unwrap_or(true);
 
+        let log_dir = env::var("AGENT_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("logs"));
+
+        let log_file_enabled = env::var("AGENT_LOG_FILE")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(true);
+
+        let log_content_limit = match env::var("AGENT_LOG_CONTENT_LIMIT") {
+            Ok(v) => v
+                .trim()
+                .parse::<usize>()
+                .with_context(|| format!("AGENT_LOG_CONTENT_LIMIT 不是合法整数：{v}"))?,
+            Err(_) => 4000,
+        };
+
         Ok(Self {
             model,
             base_url,
@@ -109,6 +134,9 @@ impl Config {
             workspace,
             system_prompt,
             log_enabled,
+            log_dir,
+            log_file_enabled,
+            log_content_limit,
         })
     }
 
@@ -133,6 +161,9 @@ mod tests {
             workspace: PathBuf::from("workspace"),
             system_prompt: String::new(),
             log_enabled: true,
+            log_dir: PathBuf::from("logs"),
+            log_file_enabled: true,
+            log_content_limit: 4000,
         };
         assert_eq!(cfg.chat_url(), "https://example.com/v1/chat/completions");
     }

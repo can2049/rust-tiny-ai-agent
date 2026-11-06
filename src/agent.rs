@@ -1,11 +1,17 @@
 //! 核心循环：调用模型 → 执行工具 → 观察结果，直到模型给出最终回答。
+//!
+//! 循环里每个关键节点都会写一条运行日志（见 `logger.rs`）：请求/响应、
+//! 每一步模型说了什么、调了哪个工具、参数是什么、结果如何、耗时多少。
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
+use serde_json::json;
 
 use crate::config::Config;
 use crate::llm::{Llm, truncate};
+use crate::logger::Logger;
 use crate::tools::Registry;
 use crate::types::{Message, Part};
 
@@ -22,32 +28,105 @@ pub async fn run_agent(
     task: &str,
     llm: &Llm,
     tools: &Arc<Registry>,
+    logger: &Arc<Logger>,
     cfg: &Config,
     history: &mut Vec<Message>,
 ) -> Result<String> {
+    let run = logger.begin_run(task);
+    let started = Instant::now();
+    let history_len_before = history.len();
+
     history.push(Message::user_text(task));
 
     for step in 1..=cfg.max_steps {
         log_step(cfg, step, cfg.max_steps);
+        logger.emit(
+            Some(step),
+            "step_start",
+            json!({ "step": step, "max_steps": cfg.max_steps, "history_len": history.len() }),
+        );
 
-        let turn = llm.send(&cfg.system_prompt, history, &tools.definitions()).await?;
+        let llm_started = Instant::now();
+        let turn = match llm
+            .send(&cfg.system_prompt, history, &tools.definitions(), Some(logger))
+            .await
+        {
+            Ok(turn) => turn,
+            Err(e) => {
+                logger.emit(
+                    Some(step),
+                    "step_error",
+                    json!({
+                        "step": step,
+                        "elapsed_ms": llm_started.elapsed().as_millis() as u64,
+                        "error": format!("{e:#}"),
+                    }),
+                );
+                logger.emit(
+                    None,
+                    "task_end",
+                    json!({
+                        "run": run,
+                        "outcome": "llm_error",
+                        "steps": step,
+                        "elapsed_ms": started.elapsed().as_millis() as u64,
+                        "error": format!("{e:#}"),
+                    }),
+                );
+                return Err(e);
+            }
+        };
+        let llm_elapsed = llm_started.elapsed();
+
         history.push(Message::assistant(turn.parts.clone()));
 
         let calls = turn.tool_calls();
+        logger.emit(
+            Some(step),
+            "llm_turn",
+            json!({
+                "step": step,
+                "elapsed_ms": llm_elapsed.as_millis() as u64,
+                "stop_reason": turn.stop_reason,
+                "text": logger.clip(&turn.text()),
+                "tool_calls": calls
+                    .iter()
+                    .map(|(id, name, input)| json!({ "id": id, "name": name, "input": input }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+
         if calls.is_empty() {
-            let answer = history
-                .last()
-                .map(Message::text)
-                .unwrap_or_default();
+            let answer = history.last().map(Message::text).unwrap_or_default();
             log_line(cfg, &format!("最终回答（stop_reason={}）", turn.stop_reason));
+            logger.emit(
+                None,
+                "task_end",
+                json!({
+                    "run": run,
+                    "outcome": "answered",
+                    "steps": step,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "history_len": history.len(),
+                    "added_messages": history.len() - history_len_before,
+                    "answer": logger.clip(&answer),
+                }),
+            );
             return Ok(answer);
         }
 
         let mut results = Vec::new();
         for (id, name, input) in calls {
             log_line(cfg, &format!("调用工具 {name}，参数：{input}"));
+            logger.emit(
+                Some(step),
+                "tool_call",
+                json!({ "step": step, "id": id, "tool": name, "input": input }),
+            );
+
             let registry = Arc::clone(tools);
             let tool_name = name.clone();
+            let tool_started = Instant::now();
             // 工具是同步实现（其中天气工具用阻塞 HTTP），放到阻塞线程池里执行，
             // 避免卡住异步运行时的工作线程。
             let (content, is_error) = tokio::task::spawn_blocking(move || {
@@ -55,6 +134,7 @@ pub async fn run_agent(
             })
             .await
             .unwrap_or_else(|e| (format!("工具执行线程异常：{e}"), true));
+            let tool_elapsed = tool_started.elapsed();
 
             log_line(
                 cfg,
@@ -64,6 +144,16 @@ pub async fn run_agent(
                     truncate(&content, LOG_RESULT_LIMIT)
                 ),
             );
+            let mut result_event = logger.clip(&content);
+            if let serde_json::Value::Object(ref mut map) = result_event {
+                map.insert("step".into(), json!(step));
+                map.insert("id".into(), json!(id));
+                map.insert("tool".into(), json!(name));
+                map.insert("is_error".into(), json!(is_error));
+                map.insert("elapsed_ms".into(), json!(tool_elapsed.as_millis() as u64));
+            }
+            logger.emit(Some(step), "tool_result", result_event);
+
             results.push(Part::ToolResult {
                 tool_use_id: id,
                 content: truncate(&content, HISTORY_RESULT_LIMIT),
@@ -78,6 +168,18 @@ pub async fn run_agent(
         cfg.max_steps
     );
     log_line(cfg, &msg);
+    logger.emit(
+        None,
+        "task_end",
+        json!({
+            "run": run,
+            "outcome": "max_steps",
+            "steps": cfg.max_steps,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "history_len": history.len(),
+            "added_messages": history.len() - history_len_before,
+        }),
+    );
     Ok(msg)
 }
 

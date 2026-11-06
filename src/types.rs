@@ -124,6 +124,20 @@ impl AssistantTurn {
             })
             .collect()
     }
+
+    /// 把本次回复的所有文本片段拼起来（不含工具调用）。
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        for part in &self.parts {
+            if let Part::Text(t) = part {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(t);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

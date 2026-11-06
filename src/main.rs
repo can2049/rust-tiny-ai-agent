@@ -3,6 +3,7 @@
 mod agent;
 mod config;
 mod llm;
+mod logger;
 mod tools;
 mod types;
 
@@ -10,9 +11,11 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use serde_json::json;
 
 use crate::config::Config;
 use crate::llm::Llm;
+use crate::logger::Logger;
 use crate::tools::Registry;
 use crate::types::Message;
 
@@ -37,9 +40,26 @@ async fn real_main() -> Result<()> {
 
     let llm = Llm::new(&cfg)?;
     let tools = Arc::new(Registry::with_builtins(&workspace));
+    let logger = Arc::new(Logger::new(&cfg)?);
+    logger.emit(
+        None,
+        "session_start",
+        json!({
+            "model": cfg.model,
+            "base_url": cfg.base_url,
+            "max_steps": cfg.max_steps,
+            "max_tokens": cfg.max_tokens,
+            "workspace": workspace.display().to_string(),
+            "log_enabled": cfg.log_enabled,
+            "system_prompt": logger.clip(&cfg.system_prompt),
+        }),
+    );
 
     println!("tiny_ai_agent 已就绪（模型 {}，最大循环 {} 步）", cfg.model, cfg.max_steps);
     println!("工作目录：{}", workspace.display());
+    if let Some(path) = logger.path() {
+        println!("运行日志：{}", path.display());
+    }
     println!("输入任务开始对话，输入 exit 退出。\n");
 
     let mut history: Vec<Message> = Vec::new();
@@ -73,7 +93,7 @@ async fn real_main() -> Result<()> {
         // 中断时把历史回滚到任务开始前，避免留下半截对话。
         let snapshot = history.clone();
         let result = tokio::select! {
-            r = agent::run_agent(task, &llm, &tools, &cfg, &mut history) => Some(r),
+            r = agent::run_agent(task, &llm, &tools, &logger, &cfg, &mut history) => Some(r),
             _ = tokio::signal::ctrl_c() => None,
         };
 
@@ -85,9 +105,19 @@ async fn real_main() -> Result<()> {
             }
             None => {
                 history = snapshot;
+                logger.emit(
+                    None,
+                    "task_end",
+                    json!({ "outcome": "interrupted", "task": task }),
+                );
                 println!("\n[已中断] 本次任务已取消，可以继续输入下一个任务。\n");
             }
         }
+    }
+
+    logger.emit(None, "session_end", json!({ "history_len": history.len() }));
+    if let Some(path) = logger.path() {
+        println!("本次运行日志：{}", path.display());
     }
 
     Ok(())

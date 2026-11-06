@@ -5,3 +5,6 @@
 # agent 的工作目录内容（运行产物、验收夹具）不入库
 /workspace/*
 !/workspace/.gitkeep
+
+# 运行日志（JSONL）不入库；需要分享时单独挑一个文件拷出来
+/logs/
